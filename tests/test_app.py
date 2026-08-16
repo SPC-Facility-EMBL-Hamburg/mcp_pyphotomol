@@ -129,7 +129,9 @@ async def test_stdio_transport_ignores_blank_lines():
         await read_stream.aclose()
 
     assert not isinstance(received, Exception)
-    assert received.message.root.method == "ping"
+    # Support both MCP 1.x (.root.method) and MCP 2.x (.method) APIs
+    message = received.message.root if hasattr(received.message, 'root') else received.message
+    assert message.method == "ping"
 
 
 @pytest.mark.asyncio

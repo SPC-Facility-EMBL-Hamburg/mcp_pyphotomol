@@ -31,6 +31,7 @@ dependencies = [
   "numpy>=2.4.2",
   "pandas>=3.0.1",
   "plotly>=6.6.0",
+  "pydantic-settings",
   "pyphotomol>=0.1.5",
   "scipy>=1.17.1",
 ]
@@ -91,6 +92,8 @@ python = [ "3.13" ]
 
 [tool.hatch.envs.hatch-test]
 features = [ "test" ]
+scripts.run-cov = "pytest {args}"
+scripts.coverage = "coverage {args}"
 
 [tool.hatch.envs.hatch-test.overrides]
 # If the matrix variable `deps` is set to "pre",
