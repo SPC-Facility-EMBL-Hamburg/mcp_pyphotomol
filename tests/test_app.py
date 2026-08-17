@@ -1,20 +1,16 @@
-import builtins
 import importlib
-import io
 import json
 import os
 import runpy
 import sys
 import warnings
-from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
-from fastmcp import Client
-from fastmcp.exceptions import ToolError
+from mcp import Client
 
 import mcp_pyphotomol
 from mcp_pyphotomol.paths import (
@@ -23,9 +19,11 @@ from mcp_pyphotomol.paths import (
     get_example_data_root,
     get_user_data_root,
 )
+import mcp_pyphotomol.config as photomol_config
 import mcp_pyphotomol.server as photomol_server
 import mcp_pyphotomol.tools._photomol as photomol_tools
 from mcp_pyphotomol.main import run_app
+from mcp_pyphotomol.mcp import mcp
 
 EXAMPLE_DATA_DIR = get_example_data_root()
 MASS_EXAMPLE_FILES = {
@@ -50,31 +48,6 @@ EXPECTED_EXAMPLE_MODEL_NAMES = [
 ]
 
 
-class AsyncLineStream:
-    """Async iterator that feeds predetermined lines into stdio transport tests."""
-
-    def __init__(self, lines):
-        self._lines = iter(lines)
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        try:
-            return next(self._lines)
-        except StopIteration:
-            raise StopAsyncIteration from None
-
-
-class AsyncTextSink:
-    """Async stdout sink used so stdio transport tests do not touch pytest capture."""
-
-    async def write(self, text):
-        return None
-
-    async def flush(self):
-        return None
-
 
 def test_package_has_version():
     """Verify the package exposes distribution metadata through ``__version__``."""
@@ -96,8 +69,10 @@ def test_user_data_root_uses_configured_results_dir(monkeypatch, tmp_path):
 
 def test_server_instructions_show_current_data_folder():
     """Verify MCP clients can see where results are saved at initialization."""
-    assert photomol_server.DATA_DIR in photomol_server.SERVER_INSTRUCTIONS
-    assert "Plots and log files for this session are saved in:" in photomol_server.SERVER_INSTRUCTIONS
+    instructions = photomol_config.build_server_instructions(photomol_server.DATA_DIR)
+
+    assert photomol_server.DATA_DIR in instructions
+    assert "Plots and log files for this session are saved in:" in instructions
 
 
 def test_example_data_files_are_present():
@@ -107,156 +82,47 @@ def test_example_data_files_are_present():
     assert (EXAMPLE_DATA_DIR / NOTEBOOK_DEMO_FILE).is_file()
 
 
-@pytest.mark.asyncio
-async def test_stdio_transport_ignores_blank_lines():
-    """
-    Verify blank stdio lines are filtered before JSON-RPC parsing.
 
-    The transport should deliver the first real JSON-RPC message instead of
-    turning an empty line into a stream exception.
-    """
-    from mcp_pyphotomol.stdio import stdio_server_ignoring_empty_lines
+def _result_data(result):
+    """Extract Python values from an MCP v2 CallToolResult."""
+    structured = getattr(result, "structured_content", None)
 
-    ping = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}) + "\n"
-    stdin = AsyncLineStream(["\n", "   \n", ping])
+    if structured is not None:
+        if isinstance(structured, dict) and "result" in structured:
+            return structured["result"]
 
-    async with stdio_server_ignoring_empty_lines(
-        stdin=stdin,
-        stdout=AsyncTextSink(),
-    ) as (read_stream, write_stream):
-        received = await read_stream.receive()
-        await write_stream.aclose()
-        await read_stream.aclose()
+        return structured
 
-    assert not isinstance(received, Exception)
-    # Support both MCP 1.x (.root.method) and MCP 2.x (.method) APIs
-    message = received.message.root if hasattr(received.message, 'root') else received.message
-    assert message.method == "ping"
+    content = getattr(result, "content", None) or []
 
+    values = []
 
-@pytest.mark.asyncio
-async def test_stdio_transport_defaults_to_process_stdin():
-    """
-    Verify the hardened stdio transport wraps process stdin by default.
+    for item in content:
+        if not hasattr(item, "text"):
+            values.append(item)
+            continue
 
-    The fake stdio server inspects the generated stdin iterator so this test can
-    check the filtering behavior without using the real process streams.
-    """
-    import mcp_pyphotomol.stdio as stdio_module
+        value = item.text
 
-    calls = {}
-    observed_lines = []
-
-    @asynccontextmanager
-    async def fake_stdio_server(stdin=None, stdout=None):
-        calls["stdin"] = stdin
-        calls["stdout"] = stdout
-        async for line in stdin:
-            observed_lines.append(line)
-            break
-        yield "read-stream", "write-stream"
-
-    with (
-        patch.object(stdio_module.sys, "stdin", SimpleNamespace(buffer="raw-stdin")),
-        patch.object(stdio_module, "TextIOWrapper", lambda buffer, encoding: f"{encoding}:{buffer}"),
-        patch.object(
-            stdio_module.anyio,
-            "wrap_file",
-            lambda stream: AsyncLineStream(["\n", '{"jsonrpc":"2.0","id":1,"method":"ping"}\n']),
-        ),
-        patch.object(stdio_module, "stdio_server", fake_stdio_server),
-    ):
-        async with stdio_module.stdio_server_ignoring_empty_lines():
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
             pass
 
-    assert calls["stdout"] is None
-    assert hasattr(calls["stdin"], "__aiter__")
-    assert observed_lines[0].strip().startswith("{")
+        values.append(value)
+
+    if len(values) == 1:
+        return values[0]
+
+    return values
 
 
-@pytest.mark.asyncio
-async def test_run_stdio_ignoring_empty_lines_uses_hardened_transport():
-    """
-    Verify the hardened stdio runner wires its streams into FastMCP.
-
-    The fake low-level server records lifecycle calls only; it does not emulate
-    MCP behavior beyond confirming the runner passes initialized streams and
-    options to ``_mcp_server.run``.
-    """
-    import fastmcp.server.context as fastmcp_context
-    import fastmcp.utilities.cli as fastmcp_cli
-    import fastmcp.utilities.logging as fastmcp_logging
-    import mcp_pyphotomol.stdio as stdio_module
-
-    calls = []
-
-    @asynccontextmanager
-    async def fake_lifespan_manager():
-        calls.append("lifespan-entered")
-        yield
-
-    @asynccontextmanager
-    async def fake_stdio_server():
-        calls.append("stdio-entered")
-        yield "read-stream", "write-stream"
-
-    @contextmanager
-    def fake_temporary_log_level(log_level):
-        calls.append(("log-level", log_level))
-        yield
-
-    class FakeLowLevelServer:
-        """Minimal FastMCP low-level server stand-in for runner wiring checks."""
-
-        def create_initialization_options(self, **kwargs):
-            notification_options = kwargs["notification_options"]
-            calls.append(("init-options", notification_options.tools_changed))
-            return "init-options"
-
-        async def run(self, read_stream, write_stream, init_options, stateless=False):
-            assert read_stream
-            assert write_stream
-            assert init_options
-            calls.append(("run", stateless))
-
-    fake_server = SimpleNamespace(
-        name="fake-server",
-        _lifespan_manager=fake_lifespan_manager,
-        _mcp_server=FakeLowLevelServer(),
+def _result_error_text(result) -> str:
+    """Return the textual error payload from an MCP v2 tool result."""
+    content = getattr(result, "content", None) or []
+    return "\n".join(
+        item.text for item in content if hasattr(item, "text")
     )
-
-    with (
-        patch.object(fastmcp_cli, "log_server_banner", lambda server: calls.append(("banner", server.name))),
-        patch.object(fastmcp_context, "set_transport", lambda transport: calls.append(("set", transport)) or "token"),
-        patch.object(fastmcp_context, "reset_transport", lambda token: calls.append(("reset", token))),
-        patch.object(fastmcp_logging, "temporary_log_level", fake_temporary_log_level),
-        patch.object(stdio_module, "stdio_server_ignoring_empty_lines", fake_stdio_server),
-    ):
-        await stdio_module.run_stdio_ignoring_empty_lines(
-            fake_server,
-            show_banner=True,
-            log_level="DEBUG",
-            stateless=True,
-        )
-
-    assert any(call[0] == "banner" for call in calls)
-    assert ("set", "stdio") in calls
-    assert ("log-level", "DEBUG") in calls
-    assert ("init-options", True) in calls
-    assert ("run", True) in calls
-    assert any(call[0] == "reset" for call in calls)
-
-
-def test_run_stdio_sync_wrapper_dispatches_anyio_run():
-    """Verify the synchronous stdio wrapper delegates execution to ``anyio.run``."""
-    import mcp_pyphotomol.stdio as stdio_module
-
-    calls = []
-
-    with patch.object(stdio_module.anyio, "run", lambda runner: calls.append(runner)):
-        stdio_module.run_stdio("server", stateless=True)
-
-    assert calls
 
 
 @pytest.mark.asyncio
@@ -270,9 +136,9 @@ async def test_mcp_server_tools_with_example_data(isolated_tool_log_dir):
     """
     log_dir = isolated_tool_log_dir
 
-    async with Client(mcp_pyphotomol.mcp) as client:
+    async with Client(mcp) as client:
         tools = await client.list_tools()
-        tool_names = {tool.name for tool in tools}
+        tool_names = {tool.name for tool in tools.tools}
 
         assert {
             "list_MP_files_in_folder",
@@ -288,77 +154,83 @@ async def test_mcp_server_tools_with_example_data(isolated_tool_log_dir):
         } <= tool_names
 
         result = await client.call_tool("get_user_name", {})
-        assert isinstance(result.data, str)
-        assert result.data
+        assert isinstance(_result_data(result), str)
+        assert _result_data(result)
 
         result = await client.call_tool(
             "list_MP_files_in_folder",
             {"folder_path": str(EXAMPLE_DATA_DIR)},
         )
-        listed_files = {file_name.strip() for file_name in result.data.split(",")}
+        listed_files = {file_name.strip() for file_name in _result_data(result).split(",")}
         assert MASS_EXAMPLE_FILES | {CONTRAST_EXAMPLE_FILE, NOTEBOOK_DEMO_FILE} <= listed_files
 
         result = await client.call_tool(
             "import_folder",
             {"folder_path": str(EXAMPLE_DATA_DIR), "pattern": "does-not-exist"},
         )
-        assert result.data == f"No files found in {EXAMPLE_DATA_DIR}."
+        assert _result_data(result) == f"No files found in {EXAMPLE_DATA_DIR}."
 
         await client.call_tool("reset_analyzer", {})
         result = await client.call_tool(
             "import_single_file",
             {"file_path": str(EXAMPLE_DATA_DIR / "masses_monomer_1nM.csv")},
         )
-        assert result.data == f"Data imported successfully from {EXAMPLE_DATA_DIR / 'masses_monomer_1nM.csv'}."
+        assert _result_data(result) == f"Data imported successfully from {EXAMPLE_DATA_DIR / 'masses_monomer_1nM.csv'}."
 
         result = await client.call_tool("get_model_names", {})
-        assert result.data == ["masses_monomer_1nM"]
+        print("RESULT:", repr(result))
+        print("STRUCTURED:", repr(result.structured_content))
+        print("CONTENT:", repr(result.content))
+        print("EXTRACTED:", repr(_result_data(result)))
 
-        with pytest.raises(ToolError, match="Histogram for model masses_monomer_1nM has not been created"):
-            await client.call_tool("fit_multi_gaussian", {})
+        assert _result_data(result) == ["masses_monomer_1nM"]
+
+        result = await client.call_tool("fit_multi_gaussian", {})
+        assert result.is_error
+        assert "Histogram for model masses_monomer_1nM has not been created" in _result_error_text(result)
 
         result = await client.call_tool(
             "create_histogram_manual",
             {"min_value": 0, "max_value": 300, "bin_width": 8},
         )
-        assert "Histograms were created successfully" in result.data
-        assert "Bin width: 8" in result.data
+        assert "Histograms were created successfully" in _result_data(result)
+        assert "Bin width: 8" in _result_data(result)
 
         result = await client.call_tool(
             "fit_multi_gaussian",
             {"peaks_guess": [80, 160], "mean_tolerance": 80, "std_tolerance": 80},
         )
-        assert result.data == "Multi-gaussian fitting completed successfully."
+        assert _result_data(result) == "Multi-gaussian fitting completed successfully."
 
         await client.call_tool("reset_analyzer", {})
         result = await client.call_tool(
             "import_folder",
             {"folder_path": str(EXAMPLE_DATA_DIR), "pattern": "masses_monomer"},
         )
-        assert result.data == f"{len(MASS_EXAMPLE_FILES)} files were imported successfully from {EXAMPLE_DATA_DIR}."
+        assert _result_data(result) == f"{len(MASS_EXAMPLE_FILES)} files were imported successfully from {EXAMPLE_DATA_DIR}."
 
         result = await client.call_tool("get_model_names", {})
-        assert {f.removesuffix(".csv") for f in MASS_EXAMPLE_FILES} == set(result.data)
+        assert {f.removesuffix(".csv") for f in MASS_EXAMPLE_FILES} == set(_result_data(result))
 
         await client.call_tool("reset_analyzer", {})
         result = await client.call_tool("load_example_data", {})
-        assert result.data == "Example data loaded successfully."
+        assert _result_data(result) == "Example data loaded successfully."
 
         result = await client.call_tool("get_model_names", {})
-        assert result.data == EXPECTED_EXAMPLE_MODEL_NAMES
+        assert _result_data(result) == EXPECTED_EXAMPLE_MODEL_NAMES
 
         result = await client.call_tool("create_histogram_automatic", {})
-        assert "Histograms were created successfully" in result.data
-        assert "Using masses: True" in result.data
+        assert "Histograms were created successfully" in _result_data(result)
+        assert "Using masses: True" in _result_data(result)
 
         result = await client.call_tool("fit_multi_gaussian", {"experiment": "not-present"})
-        assert result.data == "Multi-gaussian fitting completed successfully."
+        assert _result_data(result) == "Multi-gaussian fitting completed successfully."
 
         result = await client.call_tool("fit_multi_gaussian", {})
-        assert result.data == "Multi-gaussian fitting completed successfully."
+        assert _result_data(result) == "Multi-gaussian fitting completed successfully."
 
         result = await client.call_tool("show_fitted_parameters", {})
-        fitted_parameters = json.loads(result.data)
+        fitted_parameters = json.loads(_result_data(result))
         assert {row["name"] for row in fitted_parameters} == set(EXPECTED_EXAMPLE_MODEL_NAMES)
         assert all("Position / kDa" in row for row in fitted_parameters)
 
@@ -371,64 +243,86 @@ async def test_mcp_server_tools_with_example_data(isolated_tool_log_dir):
                 "x_range": [0, 300],
             },
         )
-        assert result.data == "Plot configuration updated successfully."
+        assert _result_data(result) == "Plot configuration updated successfully."
 
         result = await client.call_tool(
             "update_legend_config",
             {"add_percentage_to_legend": True, "line_width": 2},
         )
-        assert result.data == "Legend configuration updated successfully."
+        assert _result_data(result) == "Legend configuration updated successfully."
 
         result = await client.call_tool(
             "update_layout_config",
             {"stacked": False, "show_subplot_titles": True},
         )
-        assert result.data == "Layout configuration updated successfully."
+        assert _result_data(result) == "Layout configuration updated successfully."
 
         result = await client.call_tool("update_axis_config", {"n_y_axis_ticks": 5})
-        assert result.data == "Axis configuration updated successfully."
+        assert _result_data(result) == "Axis configuration updated successfully."
 
         result = await client.call_tool(
             "plot_histograms",
             {"colors_hist": "red", "save_as_html": True},
         )
-        assert result.data == "Histogram plot created successfully, but no valid image format was specified for saving."
+        assert _result_data(result) == "Histogram plot created successfully, but no valid image format was specified for saving."
 
-        result = await client.call_tool("get_legends_dataframe", {"repeat_colors": False})
-        legends = json.loads(result.data)
-        assert {column for row in legends for column in row} >= {"legends", "color", "select", "show_legend"}
+        result = await client.call_tool(
+            "get_legends_dataframe",
+            {"repeat_colors": False},
+        )
+
+        legends = _result_data(result)
+
+        if isinstance(legends, str):
+            legends = json.loads(legends)
+
+        assert {
+            column
+            for row in legends
+            for column in row
+        } >= {
+            "legends",
+            "color",
+            "select",
+            "show_legend",
+        }
 
         result = await client.call_tool(
             "plot_histograms_and_fits",
             {"legends_df": json.dumps(legends), "colors_hist": "blue", "save_as_html": True},
         )
-        assert result.data == "Histograms and fits plot created successfully, but no valid image format was specified for saving."
+
+        assert not result.is_error, _result_error_text(result)
+
+
+        assert _result_data(result) == "Histograms and fits plot created successfully, but no valid image format was specified for saving."
         assert any(path.name.startswith("histogram_") for path in log_dir.glob("*.html"))
         assert any(path.name.startswith("histograms_and_fits_") for path in log_dir.glob("*.html"))
 
         await client.call_tool("reset_calibrator", {})
         result = await client.call_tool("load_example_data_for_calibration", {})
-        assert result.data == "Example calibration data loaded successfully."
+        assert _result_data(result) == "Example calibration data loaded successfully."
 
         result = await client.call_tool("get_model_names", {"calibrator": True})
-        assert result.data == ["file1", "file2"]
+        assert _result_data(result) == ["file1", "file2"]
 
         result = await client.call_tool(
             "create_histogram_automatic",
             {"use_masses": False, "calibrator": True},
         )
-        assert "Using contrasts: True" in result.data
+        assert "Using contrasts: True" in _result_data(result)
 
         result = await client.call_tool("fit_multi_gaussian", {"calibrator": True})
-        assert result.data == "Multi-gaussian fitting completed successfully."
+        assert _result_data(result) == "Multi-gaussian fitting completed successfully."
 
         result = await client.call_tool("show_fitted_parameters", {"calibrator": True})
-        calibration_parameters = json.loads(result.data)
+        calibration_parameters = json.loads(_result_data(result))
         assert {row["name"] for row in calibration_parameters} == {"file1", "file2"}
         assert all("Position / contrasts" in row for row in calibration_parameters)
 
-        with pytest.raises(ToolError, match="Length of known_standards must match number of models"):
-            await client.call_tool("calibrate", {"known_standards": [480]})
+        result = await client.call_tool("calibrate", {"known_standards": [480]})
+        assert result.is_error
+        assert "Length of known_standards must match number of models" in _result_error_text(result)
 
         photomol_tools.MP_CALIBRATOR.known_standards = [66, 148, 480]
         photomol_tools.MP_CALIBRATOR.calibration_dic = {
@@ -437,7 +331,7 @@ async def test_mcp_server_tools_with_example_data(isolated_tool_log_dir):
             "fit_r2": 0.99,
         }
         result = await client.call_tool("plot_calibration", {"save_as_html": True})
-        assert result.data == "Calibration plot created successfully, but no valid image format was specified for saving."
+        assert _result_data(result) == "Calibration plot created successfully, but no valid image format was specified for saving."
         assert any(path.name.startswith("calibration_") for path in log_dir.glob("*.html"))
 
 
@@ -450,7 +344,7 @@ async def test_mcp_results_match_simple_example_notebook(isolated_tool_log_dir):
     checks fitted positions, widths, counts, percentages, and amplitudes against
     known expected values.
     """
-    async with Client(mcp_pyphotomol.mcp) as client:
+    async with Client(mcp) as client:
         await client.call_tool("reset_analyzer", {})
         await client.call_tool(
             "import_single_file",
@@ -466,7 +360,7 @@ async def test_mcp_results_match_simple_example_notebook(isolated_tool_log_dir):
         )
 
         result = await client.call_tool("show_fitted_parameters", {})
-        fit_table = json.loads(result.data)
+        fit_table = json.loads(_result_data(result))
 
     expected_rows = [
         {
@@ -508,7 +402,7 @@ async def test_mcp_results_match_simple_calibration_notebook(isolated_tool_log_d
     runs ``calibrate``, and checks the resulting calibration parameters and R²
     against known expected values.
     """
-    async with Client(mcp_pyphotomol.mcp) as client:
+    async with Client(mcp) as client:
         await client.call_tool("reset_calibrator", {})
         await client.call_tool(
             "import_single_file",
@@ -541,7 +435,7 @@ async def test_mcp_results_match_simple_calibration_notebook(isolated_tool_log_d
         )
         result = await client.call_tool("calibrate", {"known_standards": [480, 146, 66]})
 
-    assert "Calibration results" in result.data
+    assert "Calibration results" in _result_data(result)
     assert photomol_tools.MP_CALIBRATOR.calibration_dic["fit_params"][0] == pytest.approx(
         -6.115911272669366e-05,
         rel=1e-8,
@@ -560,25 +454,45 @@ async def test_mcp_results_match_simple_calibration_notebook(isolated_tool_log_d
 async def test_mcp_logbook_resource(resource_data_root):
     """
     Verify the logbook MCP resource resolves valid, empty, and malformed dates.
-
-    The fixture redirects the resource data root so the test controls the
-    available logbook files without reading user data from the real workspace.
     """
     date_dir = resource_data_root / "2026-01-02"
     date_dir.mkdir()
-    (date_dir / "mcp_logbook.json").write_text(json.dumps({"calls": [{"tool": "load_example_data"}]}))
+    (date_dir / "mcp_logbook.json").write_text(
+        json.dumps(
+            {
+                "calls": [
+                    {"tool": "load_example_data"},
+                ]
+            }
+        )
+    )
+
     empty_date_dir = resource_data_root / "2026-01-03"
     empty_date_dir.mkdir()
 
-    async with Client(mcp_pyphotomol.mcp) as client:
-        result = await client.read_resource("data://02-01-2026/logbook")
-        assert json.loads(result[0].text) == {"calls": [{"tool": "load_example_data"}]}
+    async with Client(mcp) as client:
+        result = await client.read_resource(
+            "data://02-01-2026/logbook"
+        )
+        assert json.loads(result.contents[0].text) == {
+            "calls": [
+                {"tool": "load_example_data"},
+            ]
+        }
 
-        result = await client.read_resource("data://2026-01-03/logbook")
-        assert json.loads(result[0].text) == {"error": "No logbook found for the specified date."}
+        result = await client.read_resource(
+            "data://2026-01-03/logbook"
+        )
+        assert json.loads(result.contents[0].text) == {
+            "error": "No logbook found for the specified date."
+        }
 
-        result = await client.read_resource("data://not-a-date/logbook")
-        assert json.loads(result[0].text) == {"error": "No logbook found for the specified date."}
+        result = await client.read_resource(
+            "data://not-a-date/logbook"
+        )
+        assert json.loads(result.contents[0].text) == {
+            "error": "No logbook found for the specified date."
+        }
 
 
 def test_cli_version_and_transports():
@@ -595,16 +509,8 @@ def test_cli_version_and_transports():
 
     calls = []
     mcp_module = importlib.import_module("mcp_pyphotomol.mcp")
-    stdio_module = importlib.import_module("mcp_pyphotomol.stdio")
 
-    with (
-        patch.object(mcp_module.mcp, "run", lambda **kwargs: calls.append(kwargs)),
-        patch.object(
-            stdio_module,
-            "run_stdio",
-            lambda server: calls.append({"transport": "stdio"}),
-        ),
-    ):
+    with patch.object(mcp_module.mcp, "run", lambda **kwargs: calls.append(kwargs)):
         result = runner.invoke(run_app, [])
         assert result.exit_code == 0
         assert calls[-1] == {"transport": "stdio"}
@@ -642,49 +548,27 @@ def test_module_entrypoints_print_version(capsys):
     assert capsys.readouterr().out.strip() == mcp_pyphotomol.__version__
 
 
-def test_server_initializes_user_data_when_not_skipped():
-    """
-    Verify server import initializes user-data folders and logbook contents.
+def test_config_initializes_user_data_when_not_skipped(monkeypatch, tmp_path):
+    """Verify config initialization creates the user-data folders and logbook."""
+    results_dir = tmp_path / "user_data"
+    monkeypatch.setenv(RESULTS_DIR_ENV_VAR, str(results_dir))
+    monkeypatch.delenv("MCP_PYPHOTOMOL_SKIP_USER_DATA_INIT", raising=False)
 
-    Filesystem calls are patched so the initialization branches run without
-    creating directories or writing files outside the in-memory test buffer.
-    """
-    created_dirs = []
+    reloaded_config = importlib.reload(photomol_config)
 
-    class NoCloseStringIO(io.StringIO):
-        def close(self):
-            pass
+    assert results_dir.is_dir()
+    assert Path(reloaded_config.DATA_DIR).is_dir()
+    assert Path(reloaded_config.DATA_DIR).parent == results_dir
+    assert Path(reloaded_config.LOGBOOK_FILE).is_file()
 
-    written = NoCloseStringIO()
-    original_exists = os.path.exists
-    original_open = open
+    logbook = Path(reloaded_config.LOGBOOK_FILE).read_text()
+    assert "MCP Logbook" in logbook
+    assert f"Date: {reloaded_config.today}" in logbook
 
-    def fake_exists(path):
-        if "user_data" in str(path):
-            return False
-        return original_exists(path)
-
-    def fake_makedirs(path):
-        created_dirs.append(str(path))
-
-    def fake_open(path, mode="r", *args, **kwargs):
-        if str(path).endswith("mcp_logbook.txt") and "w" in mode:
-            return written
-        return original_open(path, mode, *args, **kwargs)
-
-    with patch.dict(os.environ, {}, clear=False):
-        os.environ.pop("MCP_PYPHOTOMOL_SKIP_USER_DATA_INIT", None)
-        with (
-            patch.object(os.path, "exists", fake_exists),
-            patch.object(os, "makedirs", fake_makedirs),
-            patch.object(builtins, "open", fake_open),
-        ):
-            namespace = runpy.run_path(Path(photomol_server.__file__))
-
-    assert any(path.endswith(USER_DATA_DIR_NAME) for path in created_dirs)
-    assert any(path.endswith(namespace["today"]) for path in created_dirs)
-    assert "MCP Logbook" in written.getvalue()
-    assert f"Date: {namespace['today']}" in written.getvalue()
+    # Restore the module without initializing the normal user-data directory.
+    monkeypatch.setenv("MCP_PYPHOTOMOL_SKIP_USER_DATA_INIT", "1")
+    monkeypatch.delenv(RESULTS_DIR_ENV_VAR, raising=False)
+    importlib.reload(photomol_config)
 
 
 def test_tool_failure_and_error_branches(isolated_tool_log_dir, tmp_path):

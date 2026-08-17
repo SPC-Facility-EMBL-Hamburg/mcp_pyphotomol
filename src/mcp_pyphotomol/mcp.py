@@ -1,9 +1,14 @@
-from fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-from .server import mcp as _mcp
+from .config import SERVER_INSTRUCTIONS
+
+
+mcp: MCPServer = MCPServer(
+    name="mcp_server_photomol",
+    instructions=SERVER_INSTRUCTIONS,
+)
 
 # Import modules for their registration side effects.
-from .resources import *  # noqa: F403
-from .tools import *  # noqa: F403
-
-mcp: FastMCP = _mcp
+# These must come after `mcp` is created.
+from .resources import *  # noqa: E402,F403
+from .tools import *  # noqa: E402,F403

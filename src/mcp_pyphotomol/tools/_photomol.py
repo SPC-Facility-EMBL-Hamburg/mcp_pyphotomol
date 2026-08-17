@@ -1,32 +1,29 @@
 
+import glob
 import json
 import os
-import glob
-import pandas as pd
-import numpy as np
-import json
-
-from io import StringIO
-
-from ..server import (
-    mcp, 
-    MP_ANALYZER, 
-    MP_CALIBRATOR,
-    PLOT_CONFIG, 
-    LEGEND_CONFIG, 
-    LAYOUT_CONFIG, 
-    AXIS_CONFIG,
-    DATA_DIR, 
-    EXAMPLE_DATA_DIR
-)
-
-from datetime  import datetime
+from datetime import datetime
 from functools import wraps
-from pathlib   import Path
+from pathlib import Path
+from typing import Any
 
+import numpy as np
+import pandas as pd
+
+from pyphotomol import plot_calibration as pm_plot_calibration
 from pyphotomol import plot_histogram as pm_plot_histogram
 from pyphotomol import plot_histograms_and_fits as pm_plot_histograms_and_fits
-from pyphotomol import plot_calibration as pm_plot_calibration
+
+from ..config import DATA_DIR, EXAMPLE_DATA_DIR
+from ..mcp import mcp
+from ..server import (
+    AXIS_CONFIG,
+    LAYOUT_CONFIG,
+    LEGEND_CONFIG,
+    MP_ANALYZER,
+    MP_CALIBRATOR,
+    PLOT_CONFIG,
+)
 
 def append_function_call_to_logbook(function_name: str, params: dict) -> None:
     """
@@ -167,7 +164,7 @@ def reset_calibrator() -> str:
     return "MP_CALIBRATOR instance has been reset."
 
 @tool_with_log()
-def get_model_names(calibrator: bool = False) -> list:
+def get_model_names(calibrator: bool = False) -> list[str]:
     """
     Get the names of the models in the MP_ANALYZER or MP_CALIBRATOR instance.
 
@@ -179,7 +176,7 @@ def get_model_names(calibrator: bool = False) -> list:
 
     Returns
     -------
-    list
+    list[str]
         A list of model names.
     """
     py_object = MP_CALIBRATOR if calibrator else MP_ANALYZER
@@ -1046,42 +1043,38 @@ def show_fitted_parameters(
 @tool_with_log()
 def get_legends_dataframe(
     repeat_colors: bool = True,
-    calibrator: bool = False
-) -> str:
-
+    calibrator: bool = False,
+) -> list[dict[str, Any]]:
     """
     Obtain default labels and colors to plot the fitted histograms.
 
     Parameters
     ----------
     repeat_colors : bool, default True
-        If True, repeat the same color scheme for each model’s peaks.
+        If True, repeat the same color scheme for each model's peaks.
         If False, use sequential colors across all peaks from all models.
     calibrator : bool
-        If True, the legends will be obtained for the MP_CALIBRATOR instance instead of MP_ANALYZER.
-        This is useful for calibration data.
+        If True, obtain legends for the MP_CALIBRATOR instance instead of
+        MP_ANALYZER.
 
     Returns
     -------
-    str
-        A JSON string containing the legends and colors for the fitted histograms.
-        The four columns are ['legends', 'color', 'select', 'show_legend'].
-        The 'select' column controls if traces are shown or not, while
-        the 'show_legend' column controls if the legend is shown.
+    list[dict[str, Any]]
+        Legend configuration records with the fields ``legends``, ``color``,
+        ``select``, and ``show_legend``.
     """
-
     py_object = MP_CALIBRATOR if calibrator else MP_ANALYZER
 
-    legends_df, _ = py_object.create_plotting_config(repeat_colors=repeat_colors)
+    legends_df, _ = py_object.create_plotting_config(
+        repeat_colors=repeat_colors
+    )
 
-    # Convert the DataFrame to JSON
-    legends_json = legends_df.to_json(orient='records')
-
-    return legends_json
+    # Return native structured data for MCP instead of JSON encoded as a string.
+    return legends_df.to_dict(orient="records")
 
 @tool_with_log()
 def plot_histograms_and_fits(
-    legends_df: str | None = None,
+    legends_df: list[dict[str, Any]] | str | None = None,
     colors_hist: list[str] | str | None = None,
     save_as_html: bool = False,
     calibrator: bool = False
@@ -1094,8 +1087,9 @@ def plot_histograms_and_fits(
 
     Parameters  
     ----------
-    legends_df : str | None
-        A JSON string representing a DataFrame containing legends, colors, and selections
+    legends_df : list[dict[str, Any]] | str | None
+        Legend configuration records containing legends, colors, and selections.
+        A legacy JSON string is also accepted for direct Python callers.
         If None, the default legends will be used.
         This DataFrame affects the fitted curves only, not the histograms.
         It contains the columns ['legends', 'color', 'select', 'show_legend'].
@@ -1116,12 +1110,17 @@ def plot_histograms_and_fits(
         The path to the saved plot.
     Note
     ----
-    The legends_df JSON can be obtained by calling the get_legends_dataframe tool.
+    The legends_df records can be obtained by calling the get_legends_dataframe tool.
 
     """
 
+    if isinstance(legends_df, str):
+        # Backward compatibility for direct Python callers that still provide
+        # the pre-MCP-2 JSON-string representation.
+        legends_df = json.loads(legends_df)
+
     if legends_df is not None:
-        legends_df = pd.read_json(StringIO(legends_df), orient='records')
+        legends_df = pd.DataFrame(legends_df)
 
     py_object = MP_CALIBRATOR if calibrator else MP_ANALYZER
 
@@ -1176,7 +1175,7 @@ def plot_histograms_and_fits(
         return "Histograms and fits plot created successfully, but no valid image format was specified for saving."
 
 @tool_with_log()
-def calibrate(known_standards: list) -> str:
+def calibrate(known_standards: list[float] | list[list[float]]) -> str:
     """
     Obtain a calibration function using a list of known standards
     The calibration function is defined as f(mass) = contrast
@@ -1184,8 +1183,8 @@ def calibrate(known_standards: list) -> str:
 
     Parameters
     ----------
-    known_standards : list
-        A list of known standard values to be used for calibration.
+    known_standards : list[float] | list[list[float]]
+        Known standard values to use for calibration.
         Can be a list of floats in we only have one MP file
         Must be a list of lists with floats if we have multiple MP files
     Returns

@@ -1,8 +1,8 @@
 import os
 import json
 from datetime import datetime
-from ..server import mcp, DATA_DIR_NO_DATE
-
+from ..config import DATA_DIR_NO_DATE
+from ..mcp import mcp
 
 @mcp.resource("data://{date}/logbook")
 def get_mcp_logbook(date: str) -> str:

@@ -1,62 +1,17 @@
-import os
-
-from fastmcp import FastMCP
 import pyphotomol
 
-from mcp_pyphotomol.paths import get_example_data_root, get_user_data_root
+from .config import DATA_DIR, DATA_DIR_NO_DATE, EXAMPLE_DATA_DIR, LOGBOOK_FILE
 
-SKIP_USER_DATA_INIT = os.environ.get("MCP_PYPHOTOMOL_SKIP_USER_DATA_INIT") == "1"
 
-# Instance to handle the mass photometry count data
+# Instance to handle the mass photometry count data.
 MP_ANALYZER = pyphotomol.MPAnalyzer()
 
-# Instance to handle the mass photometry calibration data
+# Instance to handle the mass photometry calibration data.
 MP_CALIBRATOR = pyphotomol.MPAnalyzer()
 
-# Options for plotting
+# Options for plotting.
 PLOT_CONFIG = pyphotomol.PlotConfig(plot_height=800)
 LEGEND_CONFIG = pyphotomol.LegendConfig()
 LAYOUT_CONFIG = pyphotomol.LayoutConfig()
-LAYOUT_CONFIG.stacked = True # Set default to stacked subplots
+LAYOUT_CONFIG.stacked = True
 AXIS_CONFIG = pyphotomol.AxisConfig()
-
-
-# Define the paths to the project data directories.
-DATA_DIR = str(get_user_data_root())
-EXAMPLE_DATA_DIR = str(get_example_data_root())
-
-# Create the data directory if it doesn't exist.
-if not SKIP_USER_DATA_INIT and not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR)
-
-DATA_DIR_NO_DATE = DATA_DIR
-
-# Create a folder with the current date, inside data
-from datetime import datetime
-today = datetime.today().strftime('%Y-%m-%d')
-DATA_DIR = os.path.join(DATA_DIR, today)
-
-if not SKIP_USER_DATA_INIT and not os.path.exists(DATA_DIR):
-    os.makedirs(DATA_DIR)
-
-# Create an empty file to store the mcp logbook text file - if it doesn't exist
-logbook_file = os.path.join(DATA_DIR, 'mcp_logbook.txt')
-if not SKIP_USER_DATA_INIT and not os.path.exists(logbook_file):
-    with open(logbook_file, 'w') as f:
-        f.write("MCP Logbook\n")
-        f.write(f"Date: {today}\n")
-        f.write("MCP function calls will be added here.\n")
-
-
-SERVER_INSTRUCTIONS = f"""This server provides tools for analysing mass photometry count data.
-You can import data, create and fit histograms with a multi-gaussian model,
-and plot the results.
-There are two important instances: MP_ANALYZER for analysis and MP_CALIBRATOR for calibration.
-Plots and log files for this session are saved in: {DATA_DIR}"""
-
-
-# This is the shared MCP server instance
-mcp = FastMCP(
-    name="mcp_server_photomol",
-    instructions=SERVER_INSTRUCTIONS,
-)
