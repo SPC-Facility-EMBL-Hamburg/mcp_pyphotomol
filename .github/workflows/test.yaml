@@ -73,6 +73,12 @@ jobs:
           cache-dependency-glob: pyproject.toml
       - name: create hatch environment
         run: uvx hatch env create ${{ matrix.env.name }}
+
+      - name: Show relevant versions
+        run: |
+          uvx hatch run ${{ matrix.env.name }}:python --version
+          uvx hatch run ${{ matrix.env.name }}:python -c "import importlib.metadata as m; print('mcp:', m.version('mcp')); print('anyio:', m.version('anyio')); print('pydantic:', m.version('pydantic'))"
+
       - name: run tests using hatch
         env:
           MPLBACKEND: agg
