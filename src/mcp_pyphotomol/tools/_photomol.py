@@ -7,6 +7,8 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
+from mcp.server.mcpserver.exceptions import ToolError
+
 import numpy as np
 import pandas as pd
 
@@ -88,7 +90,10 @@ def tool_with_log():
             append_function_call_to_logbook(func.__name__, params)
             
             # Execute the original function
-            return func(*args, **kwargs)
+            try:
+                return func(*args, **kwargs)
+            except ValueError as exc:
+                raise ToolError(str(exc)) from exc
         
         # Apply the @mcp.tool() decorator to the wrapper
         return mcp.tool()(wrapper)
