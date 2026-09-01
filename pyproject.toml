@@ -4,7 +4,7 @@ requires = [ "hatchling" ]
 
 [project]
 name = "mcp_pyphotomol"
-version = "1.1.0"
+version = "1.1.1"
 description = "Analysis of mass photometry data"
 readme = "README.md"
 license = { file = "LICENSE" }
